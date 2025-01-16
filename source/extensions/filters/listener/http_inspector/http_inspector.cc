@@ -24,13 +24,56 @@ Config::Config(Stats::Scope& scope)
 const absl::string_view Filter::HTTP2_CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 thread_local uint8_t Filter::buf_[Config::MAX_INSPECT_SIZE];
 
-Filter::Filter(const ConfigSharedPtr config) : config_(config) {
-  http_parser_init(&parser_, HTTP_REQUEST);
+Filter::Filter(const ConfigSharedPtr config)
+    : config_(config), no_op_callbacks_(),
+      requested_read_bytes_(Config::DEFAULT_INITIAL_BUFFER_SIZE) {
+  // Filter for only Request Message types with NoOp Parser callbacks.
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http_inspector_use_balsa_parser")) {
+    // Set both allow_custom_methods and enable_trailers to true with BalsaParser.
+    parser_ = std::make_unique<Http::Http1::BalsaParser>(
+        Http::Http1::MessageType::Request, &no_op_callbacks_, Config::MAX_INSPECT_SIZE + 1024, true,
+        true);
+  } else {
+    parser_ = std::make_unique<Http::Http1::LegacyHttpParserImpl>(Http::Http1::MessageType::Request,
+                                                                  &no_op_callbacks_);
+  }
 }
 
-http_parser_settings Filter::settings_{
-    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-};
+Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
+  auto raw_slice = buffer.rawSlice();
+  const char* buf = static_cast<const char*>(raw_slice.mem_);
+  const auto parse_state = parseHttpHeader(absl::string_view(buf, raw_slice.len_));
+  switch (parse_state) {
+  case ParseState::Error:
+    // Invalid HTTP preface found, then just continue for next filter.
+    done(false);
+    return Network::FilterStatus::Continue;
+  case ParseState::Done:
+    done(true);
+    return Network::FilterStatus::Continue;
+  case ParseState::Continue:
+    ENVOY_LOG(trace, "http inspector: need more bytes");
+
+    // If we have requested the maximum amount of data, then close the connection
+    // the request line is too large to determine the http version.
+    if (static_cast<size_t>(nread_) >= Config::MAX_INSPECT_SIZE) {
+      ENVOY_LOG(warn, "http inspector: reached max buffer without determining HTTP version, "
+                      "dropping connection");
+      config_->stats().read_error_.inc();
+      cb_->socket().ioHandle().close();
+      return Network::FilterStatus::StopIteration;
+    }
+
+    // Otherwise, double the buffer size and try again
+    if (static_cast<size_t>(nread_) >= requested_read_bytes_) {
+      requested_read_bytes_ =
+          std::min<uint32_t>(2 * requested_read_bytes_, Config::MAX_INSPECT_SIZE);
+    }
+
+    return Network::FilterStatus::StopIteration;
+  }
+  PANIC_DUE_TO_CORRUPT_ENUM
+}
 
 Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   ENVOY_LOG(debug, "http inspector: new connection accepted");

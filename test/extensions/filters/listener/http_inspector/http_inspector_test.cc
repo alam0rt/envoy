@@ -1,4 +1,5 @@
 #include "source/common/common/hex.h"
+#include "source/common/common/logger.h"
 #include "source/common/http/utility.h"
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/extensions/filters/listener/http_inspector/http_inspector.h"
@@ -29,9 +30,10 @@ namespace {
 class HttpInspectorTest : public testing::Test {
 public:
   HttpInspectorTest()
-      : cfg_(std::make_shared<Config>(store_)),
-        io_handle_(std::make_unique<Network::IoSocketHandleImpl>(42)) {}
-  ~HttpInspectorTest() override { io_handle_->close(); }
+      : cfg_(std::make_shared<Config>(*store_.rootScope())),
+        io_handle_(
+            Network::SocketInterfaceImpl::makePlatformSpecificSocket(42, false, absl::nullopt, {})),
+        parser_impl_(GetParam()) {}
 
   void init(bool include_inline_recv = true) {
     filter_ = std::make_unique<Filter>(cfg_);
@@ -41,6 +43,15 @@ public:
     EXPECT_CALL(cb_, dispatcher()).WillRepeatedly(ReturnRef(dispatcher_));
     EXPECT_CALL(testing::Const(socket_), ioHandle()).WillRepeatedly(ReturnRef(*io_handle_));
     EXPECT_CALL(socket_, ioHandle()).WillRepeatedly(ReturnRef(*io_handle_));
+    EXPECT_CALL(dispatcher_,
+                createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                                 Event::FileReadyType::Read | Event::FileReadyType::Closed))
+        .WillOnce(
+            DoAll(SaveArg<1>(&file_event_callback_), ReturnNew<NiceMock<Event::MockFileEvent>>()));
+    buffer_ = std::make_unique<Network::ListenerFilterBufferImpl>(
+        *io_handle_, dispatcher_, [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+        Config::DEFAULT_INITIAL_BUFFER_SIZE == 0, Config::DEFAULT_INITIAL_BUFFER_SIZE);
+  }
 
     if (include_inline_recv) {
       EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
@@ -581,8 +592,8 @@ TEST_F(HttpInspectorTest, Http1WithLargeRequestLine) {
   // with large request line even when they are split over
   // multiple recv calls.
   init();
-  absl::string_view method = "GET", http = "/index HTTP/1.0\r";
-  std::string spaces(Config::MAX_INSPECT_SIZE - method.size() - http.size(), ' ');
+  absl::string_view method = "GET", http = "/index HTTP/1.0\r\n";
+  std::string spaces(Config::DEFAULT_INITIAL_BUFFER_SIZE - method.size() - http.size(), ' ');
   const std::string data = absl::StrCat(method, spaces, http);
   {
     InSequence s;
@@ -591,7 +602,7 @@ TEST_F(HttpInspectorTest, Http1WithLargeRequestLine) {
       return Api::SysCallSizeResult{ssize_t(-1), SOCKET_ERROR_AGAIN};
     }));
 
-    uint64_t num_loops = Config::MAX_INSPECT_SIZE;
+    uint64_t num_loops = Config::DEFAULT_INITIAL_BUFFER_SIZE;
 #if defined(__has_feature) &&                                                                      \
     ((__has_feature(thread_sanitizer)) || (__has_feature(address_sanitizer)))
     num_loops = 2;
@@ -605,7 +616,7 @@ TEST_F(HttpInspectorTest, Http1WithLargeRequestLine) {
           size_t len = (*ctr);
           if (num_loops == 2) {
             ASSERT(*ctr != 3);
-            len = size_t(Config::MAX_INSPECT_SIZE / (3 - (*ctr)));
+            len = size_t(Config::DEFAULT_INITIAL_BUFFER_SIZE / (3 - (*ctr)));
           }
           ASSERT(length >= len);
           memcpy(buffer, data.data(), len);
@@ -628,9 +639,9 @@ TEST_F(HttpInspectorTest, Http1WithLargeRequestLine) {
 
 TEST_F(HttpInspectorTest, Http1WithLargeHeader) {
   init();
-  absl::string_view request = "GET /index HTTP/1.0\rfield: ";
-  //                           0                  20
-  std::string value(Config::MAX_INSPECT_SIZE - request.size(), 'a');
+  absl::string_view request = "GET /index HTTP/1.0\r\nfield: ";
+  //                           0                    21
+  std::string value(Config::DEFAULT_INITIAL_BUFFER_SIZE - request.size(), 'a');
   const std::string data = absl::StrCat(request, value);
   {
     InSequence s;
@@ -659,6 +670,96 @@ TEST_F(HttpInspectorTest, Http1WithLargeHeader) {
   while (!got_continue) {
     file_event_callback_(Event::FileReadyType::Read);
   }
+  EXPECT_EQ(1, cfg_->stats().http10_found_.value());
+}
+
+TEST_P(HttpInspectorTest, HttpExceedMaxBufferSize) {
+  absl::string_view method = "GET", http = "/index HTTP/1.0\r\n";
+  std::string spaces(Config::MAX_INSPECT_SIZE, ' ');
+  const std::string data = absl::StrCat(method, spaces, http);
+
+  cfg_ = std::make_shared<Config>(*store_.rootScope());
+
+  init();
+  buffer_->resetCapacity(Config::MAX_INSPECT_SIZE);
+
+  EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+      .WillOnce(
+          Invoke([&data](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+            const size_t amount_to_copy = std::min(length, data.size());
+            memcpy(buffer, data.data(), amount_to_copy);
+            return Api::SysCallSizeResult{ssize_t(amount_to_copy), 0};
+          }));
+
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  auto accepted = filter_->onAccept(cb_);
+  EXPECT_EQ(accepted, Network::FilterStatus::StopIteration);
+  auto status = filter_->onData(*buffer_);
+  EXPECT_EQ(Network::FilterStatus::StopIteration, status);
+  EXPECT_EQ(1, cfg_->stats().read_error_.value());
+  EXPECT_FALSE(io_handle_->isOpen());
+}
+
+TEST_P(HttpInspectorTest, HttpExceedInitialBufferSize) {
+  uint32_t buffer_size = Config::DEFAULT_INITIAL_BUFFER_SIZE;
+
+  absl::string_view method = "GET", http = "/index HTTP/1.0\r\n";
+
+  // Want to test doubling a couple times.
+  std::string spaces(buffer_size * 3, ' ');
+
+  const std::string data = absl::StrCat(method, spaces, http);
+
+  init();
+
+  EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+      .WillOnce(
+          Invoke([&data](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+            const size_t amount_to_copy = std::min(length, data.size());
+            memcpy(buffer, data.data(), amount_to_copy);
+            return Api::SysCallSizeResult{ssize_t(amount_to_copy), 0};
+          }));
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  auto accepted = filter_->onAccept(cb_);
+  EXPECT_EQ(accepted, Network::FilterStatus::StopIteration);
+  auto status = filter_->onData(*buffer_);
+  EXPECT_EQ(status, Network::FilterStatus::StopIteration);
+  EXPECT_EQ(filter_->maxReadBytes(), 2 * buffer_size);
+  buffer_size *= 2;
+  buffer_->resetCapacity(buffer_size);
+
+  EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+      .WillOnce(
+          Invoke([&data](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+            const size_t amount_to_copy = std::min(length, data.size());
+            memcpy(buffer, data.data(), amount_to_copy);
+            return Api::SysCallSizeResult{ssize_t(amount_to_copy), 0};
+          }));
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  status = filter_->onData(*buffer_);
+  EXPECT_EQ(status, Network::FilterStatus::StopIteration);
+  EXPECT_EQ(filter_->maxReadBytes(), 2 * buffer_size);
+  buffer_size *= 2;
+  buffer_->resetCapacity(buffer_size);
+
+  EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+      .WillOnce(
+          Invoke([&data](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+            const size_t amount_to_copy = std::min(length, data.size());
+            memcpy(buffer, data.data(), amount_to_copy);
+            return Api::SysCallSizeResult{ssize_t(amount_to_copy), 0};
+          }));
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  const std::vector<absl::string_view> alpn_protos{Http::Utility::AlpnNames::get().Http10};
+  EXPECT_CALL(socket_, setRequestedApplicationProtocols(alpn_protos));
+
+  status = filter_->onData(*buffer_);
+  EXPECT_EQ(status, Network::FilterStatus::Continue);
+
   EXPECT_EQ(1, cfg_->stats().http10_found_.value());
 }
 
