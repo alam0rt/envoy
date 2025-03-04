@@ -309,8 +309,145 @@ FilterStatus ConnectionManager::ResponseDecoder::transportEnd() {
   return FilterStatus::Continue;
 }
 
-bool ConnectionManager::ResponseDecoder::passthroughEnabled() const {
-  return parent_.parent_.passthroughEnabled();
+FilterStatus ConnectionManager::ResponseDecoder::passthroughData(Buffer::Instance& data) {
+  passthrough_ = true;
+
+  return parent_.applyEncoderFilters(DecoderEvent::PassthroughData, &data, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::messageBegin(MessageMetadataSharedPtr metadata) {
+  metadata_ = metadata;
+  metadata_->setSequenceId(parent_.original_sequence_id_);
+
+  if (metadata->hasReplyType()) {
+    // TODO(kuochunghsu): the status of success could be altered by filters
+    success_ = metadata->replyType() == ReplyType::Success;
+  }
+
+  ConnectionManager& cm = parent_.parent_;
+
+  ENVOY_STREAM_LOG(
+      trace, "Response message_type: {}, seq_id: {}, method: {}, frame size: {}, headers:\n{}",
+      parent_,
+      metadata->hasMessageType() ? MessageTypeNames::get().fromType(metadata->messageType()) : "-",
+      metadata_->sequenceId(), metadata->hasMethodName() ? metadata->methodName() : "-",
+      metadata->hasFrameSize() ? metadata->frameSize() : -1, metadata->responseHeaders());
+
+  // Check if the upstream host is draining.
+  //
+  // Note: the drain header needs to be checked here in messageBegin, and not transportBegin, so
+  // that we can support the header in TTwitter protocol, which reads/adds response headers to
+  // metadata in messageBegin when reading the response from upstream. Therefore detecting a drain
+  // should happen here.
+  metadata_->setDraining(!metadata->responseHeaders().get(Headers::get().Drain).empty());
+  metadata->responseHeaders().remove(Headers::get().Drain);
+
+  // Check if this host itself is draining.
+  //
+  // Note: Similarly as above, the response is buffered until transportEnd. Therefore metadata
+  // should be set before the encodeFrame() call. It should be set at or after the messageBegin
+  // call so that the header is added after all upstream headers passed, due to messageBegin
+  // possibly not getting headers in transportBegin.
+  if (cm.drain_decision_.drainClose(Network::DrainDirection::All)) {
+    ENVOY_STREAM_LOG(debug, "propogate Drain header for drain close decision", parent_);
+    // TODO(rgs1): should the key value contain something useful (e.g.: minutes til drain is
+    // over)?
+    metadata->responseHeaders().addReferenceKey(Headers::get().Drain, "true");
+    cm.stats_.downstream_response_drain_close_.inc();
+  }
+
+  parent_.recordResponseAccessLog(metadata);
+
+  return parent_.applyEncoderFilters(DecoderEvent::MessageBegin, metadata, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::messageEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::MessageEnd, absl::monostate(),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::structBegin(absl::string_view name) {
+  return parent_.applyEncoderFilters(DecoderEvent::StructBegin, std::string(name),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::structEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::StructEnd, absl::monostate(),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::fieldBegin(absl::string_view name,
+                                                            FieldType& field_type,
+                                                            int16_t& field_id) {
+  return parent_.applyEncoderFilters(DecoderEvent::FieldBegin,
+                                     std::make_tuple(std::string(name), field_type, field_id),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::fieldEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::FieldEnd, absl::monostate(),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::boolValue(bool& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::BoolValue, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::byteValue(uint8_t& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::ByteValue, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::int16Value(int16_t& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::Int16Value, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::int32Value(int32_t& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::Int32Value, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::int64Value(int64_t& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::Int64Value, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::doubleValue(double& value) {
+  return parent_.applyEncoderFilters(DecoderEvent::DoubleValue, value, protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::stringValue(absl::string_view value) {
+  return parent_.applyEncoderFilters(DecoderEvent::StringValue, std::string(value),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::mapBegin(FieldType& key_type,
+                                                          FieldType& value_type, uint32_t& size) {
+  return parent_.applyEncoderFilters(
+      DecoderEvent::MapBegin, std::make_tuple(key_type, value_type, size), protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::mapEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::MapEnd, absl::monostate(), protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::listBegin(FieldType& elem_type, uint32_t& size) {
+  return parent_.applyEncoderFilters(DecoderEvent::ListBegin, std::make_tuple(elem_type, size),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::listEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::ListEnd, absl::monostate(), protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::setBegin(FieldType& elem_type, uint32_t& size) {
+  return parent_.applyEncoderFilters(DecoderEvent::SetBegin, std::make_tuple(elem_type, size),
+                                     protocol_converter_);
+}
+
+FilterStatus ConnectionManager::ResponseDecoder::setEnd() {
+  return parent_.applyEncoderFilters(DecoderEvent::SetEnd, absl::monostate(), protocol_converter_);
+}
+
+bool ConnectionManager::ResponseDecoder::headerKeysPreserveCase() const {
+  return parent_.parent_.headerKeysPreserveCase();
 }
 
 void ConnectionManager::ActiveRpcDecoderFilter::continueDecoding() {

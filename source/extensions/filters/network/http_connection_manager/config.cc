@@ -225,10 +225,15 @@ HttpConnectionManagerFilterConfigFactory::createFilterFactoryFromProtoAndHopByHo
   // as these captured objects are also global singletons.
   return [singletons, filter_config, &context,
           clear_hop_by_hop_headers](Network::FilterManager& filter_manager) -> void {
+    auto& server_context = context.serverFactoryContext();
+    Server::OverloadManager& overload_manager = context.listenerInfo().shouldBypassOverloadManager()
+                                                    ? server_context.nullOverloadManager()
+                                                    : server_context.overloadManager();
     auto hcm = std::make_shared<Http::ConnectionManagerImpl>(
-        *filter_config, context.drainDecision(), context.api().randomGenerator(),
-        context.httpContext(), context.runtime(), context.localInfo(), context.clusterManager(),
-        context.overloadManager(), context.mainThreadDispatcher().timeSource());
+        filter_config, context.drainDecision(), server_context.api().randomGenerator(),
+        server_context.httpContext(), server_context.runtime(), server_context.localInfo(),
+        server_context.clusterManager(), overload_manager,
+        server_context.mainThreadDispatcher().timeSource(), context.listenerInfo().direction());
     if (!clear_hop_by_hop_headers) {
       hcm->setClearHopByHopResponseHeaders(false);
     }
@@ -827,9 +832,10 @@ HttpConnectionManagerFactory::createHttpConnectionManagerFactoryFromProto(
   return [singletons, filter_config, &context, &read_callbacks,
           clear_hop_by_hop_headers]() -> Http::ApiListenerPtr {
     auto conn_manager = std::make_unique<Http::ConnectionManagerImpl>(
-        *filter_config, context.drainDecision(), context.api().randomGenerator(),
-        context.httpContext(), context.runtime(), context.localInfo(), context.clusterManager(),
-        context.overloadManager(), context.mainThreadDispatcher().timeSource());
+        filter_config, context.drainDecision(), server_context.api().randomGenerator(),
+        server_context.httpContext(), server_context.runtime(), server_context.localInfo(),
+        server_context.clusterManager(), overload_manager,
+        server_context.mainThreadDispatcher().timeSource(), context.listenerInfo().direction());
     if (!clear_hop_by_hop_headers) {
       conn_manager->setClearHopByHopResponseHeaders(false);
     }

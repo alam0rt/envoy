@@ -623,8 +623,30 @@ TEST_P(ServerInstanceImplTest, DrainParentListenerAfterWorkersStarted) {
   EXPECT_CALL(restart_, drainParentListeners);
   workers_started_block.Notify();
 
-  server_->dispatcher().post([&] { server_->shutdown(); });
-  server_thread->join();
+  DrainManager& drain_manager = server_->drainManager();
+
+  // To reproduce the race condition from
+  // https://github.com/envoyproxy/envoy/issues/31457 we make sure that the
+  // infinite drainClose spin-loop (mimicing high traffic) is running before we
+  // initiate the drain sequence.
+  auto drain_thread = Thread::threadFactoryForTest().createThread([&] {
+    bool closed = drain_manager.drainClose(Network::DrainDirection::All);
+    drain_closes_started.Notify();
+    while (!closed) {
+      closed = drain_manager.drainClose(Network::DrainDirection::All);
+    }
+  });
+  drain_closes_started.WaitForNotification();
+
+  // Now that we are starting to try to call drainClose, we'll start the drain sequence, then
+  // wait for that to complete.
+  server_->dispatcher().post([&] {
+    drain_manager.startDrainSequence(Network::DrainDirection::All,
+                                     [&drain_complete]() { drain_complete.Notify(); });
+  });
+
+  drain_complete.WaitForNotification();
+  drain_thread->join();
 }
 
 // A test target which never signals that it is ready.

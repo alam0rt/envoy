@@ -8,7 +8,8 @@
 # leave room for compiler/linker.
 # The number 2G is chosen heuristically to both support large VM and small VM with RBE.
 # Startup options cannot be selected via config.
-startup --host_jvm_args=-Xmx2g
+# TODO: Adding just to test android
+startup --host_jvm_args=-Xmx3g
 
 run --color=yes
 

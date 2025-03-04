@@ -3,6 +3,7 @@
 #include "source/extensions/request_id/uuid/config.h"
 
 #include "test/common/http/xff_extension.h"
+#include "test/extensions/filters/network/common/fuzz/utils/fakes.h"
 
 using testing::AtLeast;
 using testing::InSequence;
@@ -64,6 +65,9 @@ void HttpConnectionManagerImplTest::setup(bool ssl, const std::string& server_na
       .WillByDefault([&](auto, auto callback) {
         return filter_callbacks_.connection_.dispatcher_.createTimer(callback).release();
       });
+
+  const Network::ListenerInfo& listener_info = Server::Configuration::FakeListenerInfo();
+  ON_CALL(factory_context_, listenerInfo()).WillByDefault(ReturnRef(listener_info));
   filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
       std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1", 443));
   filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
@@ -75,8 +79,10 @@ void HttpConnectionManagerImplTest::setup(bool ssl, const std::string& server_na
   filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setSslConnection(
       ssl_connection_);
   conn_manager_ = std::make_unique<ConnectionManagerImpl>(
-      *this, drain_close_, random_, http_context_, runtime_, local_info_, cluster_manager_,
-      overload_manager_, test_time_.timeSystem());
+      std::make_shared<ConnectionManagerConfigProxyObject>(*this), drain_close_, random_,
+      http_context_, runtime_, local_info_, cluster_manager_, overload_manager_,
+      test_time_.timeSystem(), factory_context_.listenerInfo().direction());
+
   conn_manager_->initializeReadFilterCallbacks(filter_callbacks_);
 
   if (tracing) {

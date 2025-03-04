@@ -174,8 +174,10 @@ const Upstream::ClusterManager& InstanceImpl::clusterManager() const {
 
 void InstanceImpl::drainListeners() {
   ENVOY_LOG(info, "closing and draining listeners");
-  listener_manager_->stopListeners(ListenerManager::StopListenersType::All);
-  drain_manager_->startDrainSequence([] {});
+  listener_manager_->stopListeners(ListenerManager::StopListenersType::All,
+                                   options.has_value() ? *options
+                                                       : Network::ExtraShutdownListenerOptions{});
+  drain_manager_->startDrainSequence(Network::DrainDirection::All, [] {});
 }
 
 void InstanceImpl::failHealthcheck(bool fail) {

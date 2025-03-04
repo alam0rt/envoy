@@ -31,7 +31,7 @@ TEST_P(HealthCheckIntegrationTest, DrainCloseGradual) {
 
   absl::Notification drain_sequence_started;
   test_server_->server().dispatcher().post([this, &drain_sequence_started]() {
-    test_server_->drainManager().startDrainSequence([] {});
+    test_server_->drainManager().startDrainSequence(Network::DrainDirection::All, [] {});
     drain_sequence_started.Notify();
   });
   drain_sequence_started.WaitForNotification();
@@ -64,7 +64,7 @@ TEST_P(HealthCheckIntegrationTest, DrainCloseImmediate) {
 
   absl::Notification drain_sequence_started;
   test_server_->server().dispatcher().post([this, &drain_sequence_started]() {
-    test_server_->drainManager().startDrainSequence([] {});
+    test_server_->drainManager().startDrainSequence(Network::DrainDirection::All, [] {});
     drain_sequence_started.Notify();
   });
   drain_sequence_started.WaitForNotification();

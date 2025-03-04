@@ -360,9 +360,7 @@ public:
     TestScopedRuntime scoped_runtime;
 
     if (draining) {
-      scoped_runtime.mergeValues(
-          {{"envoy.reloadable_features.thrift_connection_draining", "true"}});
-      EXPECT_CALL(drain_decision_, drainClose()).WillOnce(Return(true));
+      EXPECT_CALL(drain_decision_, drainClose(Network::DrainDirection::All)).WillOnce(Return(true));
     }
 
     initializeFilter();
@@ -1636,6 +1634,11 @@ TEST_F(ThriftConnectionManagerTest, DecoderFiltersModifyRequests) {
 }
 
 TEST_F(ThriftConnectionManagerTest, TransportEndWhenRemoteClose) {
+  TestScopedRuntime scoped_runtime;
+
+  // We want the Drain header to be set by RemoteClose which triggers end downstream in local reply.
+  EXPECT_CALL(drain_decision_, drainClose(Network::DrainDirection::All)).WillOnce(Return(false));
+
   initializeFilter();
   writeComplexFramedBinaryMessage(buffer_, MessageType::Call, 0x0F);
 

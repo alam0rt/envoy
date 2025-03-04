@@ -150,9 +150,10 @@ public:
       new_socket = listener_factory_.socket_.get();
       EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, bind_type, _, 0));
     }
-    EXPECT_CALL(*worker_, addListener(_, _, _, _));
-    EXPECT_CALL(*worker_, stopListener(_, _));
-    EXPECT_CALL(*old_listener_handle->drain_manager_, startDrainSequence(_));
+    EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+    EXPECT_CALL(*worker_, stopListener(_, _, _));
+    EXPECT_CALL(*old_listener_handle->drain_manager_,
+                startDrainSequence(Network::DrainDirection::All, _));
 
     EXPECT_TRUE(addOrUpdateListener(new_listener_proto));
 
@@ -169,7 +170,8 @@ public:
 
     EXPECT_CALL(*worker_, stopListener(_, _));
     EXPECT_CALL(socket, close());
-    EXPECT_CALL(*listener_handle->drain_manager_, startDrainSequence(_));
+    EXPECT_CALL(*listener_handle->drain_manager_,
+                startDrainSequence(Network::DrainDirection::All, _));
     EXPECT_TRUE(manager_->removeListener(listener_proto.name()));
 
     EXPECT_CALL(*worker_, removeListener(_, _));
@@ -1466,9 +1468,10 @@ dynamic_listeners:
   // removal.
   ListenerHandle* listener_foo_update2 = expectListenerCreate(false, true);
   EXPECT_CALL(*duplicated_socket, duplicate());
-  EXPECT_CALL(*worker_, addListener(_, _, _, _));
-  EXPECT_CALL(*worker_, stopListener(_, _));
-  EXPECT_CALL(*listener_foo_update1->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_CALL(*worker_, stopListener(_, _, _));
+  EXPECT_CALL(*listener_foo_update1->drain_manager_,
+              startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml), "version3", true));
   worker_->callAddCompletion();
   checkStats(__LINE__, 1, 2, 0, 0, 1, 1, 0);
@@ -1746,13 +1749,14 @@ filter_chains:
 
   // Remove foo into draining.
   std::function<void()> stop_completion;
-  EXPECT_CALL(*worker_, stopListener(_, _))
-      .WillOnce(Invoke(
-          [&stop_completion](Network::ListenerConfig&, std::function<void()> completion) -> void {
-            ASSERT_TRUE(completion != nullptr);
-            stop_completion = std::move(completion);
-          }));
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, stopListener(_, _, _))
+      .WillOnce(Invoke([&stop_completion](Network::ListenerConfig&,
+                                          const Network::ExtraShutdownListenerOptions&,
+                                          std::function<void()> completion) -> void {
+        ASSERT_TRUE(completion != nullptr);
+        stop_completion = std::move(completion);
+      }));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
   checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
   EXPECT_CALL(*worker_, removeListener(_, _));
@@ -1762,7 +1766,69 @@ filter_chains:
   // Add foo again.
   ListenerHandle* listener_foo2 = expectListenerCreate(false, true);
   EXPECT_CALL(*listener_factory_.socket_, duplicate());
-  EXPECT_CALL(*worker_, addListener(_, _, _, _));
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
+  worker_->callAddCompletion();
+  checkStats(__LINE__, 2, 0, 1, 0, 1, 1, 0);
+
+  stop_completion();
+
+  EXPECT_CALL(*listener_foo, onDestroy());
+  worker_->callRemovalCompletion();
+  checkStats(__LINE__, 2, 0, 1, 0, 1, 0, 0);
+
+  EXPECT_CALL(*listener_foo2, onDestroy());
+}
+
+TEST_P(ListenerManagerImplTest, AddReusableDrainingListenerWithMultiAddresses) {
+  InSequence s;
+
+  EXPECT_CALL(*worker_, start(_, _));
+  ASSERT_TRUE(manager_->startWorkers(guard_dog_, callback_.AsStdFunction()).ok());
+
+  // Add foo listener directly into active.
+  const std::string listener_foo_yaml = R"EOF(
+name: foo
+address:
+  socket_address:
+    address: 127.0.0.1
+    port_value: 1234
+additional_addresses:
+- address:
+    socket_address:
+      address: 127.0.0.2
+      port_value: 1234
+filter_chains:
+- filters: []
+  )EOF";
+
+  ListenerHandle* listener_foo = expectListenerCreate(false, true);
+  EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, default_bind_type, _, 0)).Times(2);
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
+  worker_->callAddCompletion();
+  checkStats(__LINE__, 1, 0, 0, 0, 1, 0, 0);
+
+  // Remove foo into draining.
+  std::function<void()> stop_completion;
+  EXPECT_CALL(*worker_, stopListener(_, _, _))
+      .WillOnce(Invoke([&stop_completion](Network::ListenerConfig&,
+                                          const Network::ExtraShutdownListenerOptions&,
+                                          std::function<void()> completion) -> void {
+        ASSERT_TRUE(completion != nullptr);
+        stop_completion = std::move(completion);
+      }));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
+  EXPECT_TRUE(manager_->removeListener("foo"));
+  checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
+  EXPECT_CALL(*worker_, removeListener(_, _));
+  listener_foo->drain_manager_->drain_sequence_completion_();
+  checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
+
+  // Add foo again.
+  ListenerHandle* listener_foo2 = expectListenerCreate(false, true);
+  EXPECT_CALL(*listener_factory_.socket_, duplicate()).Times(2);
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
   EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
   worker_->callAddCompletion();
   checkStats(__LINE__, 2, 0, 1, 0, 1, 1, 0);
@@ -1807,7 +1873,7 @@ filter_chains:
   // Remove foo into draining.
   EXPECT_CALL(*worker_, stopListener(_, _));
   EXPECT_CALL(*listener_factory_.socket_, close());
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
   checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
   EXPECT_CALL(*worker_, removeListener(_, _));
@@ -1817,7 +1883,60 @@ filter_chains:
   // Add foo again. We should use the socket from draining.
   ListenerHandle* listener_foo2 = expectListenerCreate(false, true);
   EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, default_bind_type, _, 0));
-  EXPECT_CALL(*worker_, addListener(_, _, _, _));
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
+  worker_->callAddCompletion();
+  checkStats(__LINE__, 2, 0, 1, 0, 1, 1, 0);
+
+  EXPECT_CALL(*listener_foo, onDestroy());
+  worker_->callRemovalCompletion();
+  checkStats(__LINE__, 2, 0, 1, 0, 1, 0, 0);
+
+  EXPECT_CALL(*listener_foo2, onDestroy());
+}
+
+TEST_P(ListenerManagerImplTest, AddClosedDrainingListenerWithMultiAddresses) {
+  InSequence s;
+
+  EXPECT_CALL(*worker_, start(_, _));
+  ASSERT_TRUE(manager_->startWorkers(guard_dog_, callback_.AsStdFunction()).ok());
+
+  // Add foo listener directly into active.
+  const std::string listener_foo_yaml = R"EOF(
+name: foo
+address:
+  socket_address:
+    address: 127.0.0.1
+    port_value: 1234
+additional_addresses:
+- address:
+    socket_address:
+      address: 127.0.0.2
+      port_value: 4567
+filter_chains:
+- filters: []
+  )EOF";
+
+  ListenerHandle* listener_foo = expectListenerCreate(false, true);
+  EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, default_bind_type, _, 0)).Times(2);
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
+  worker_->callAddCompletion();
+  checkStats(__LINE__, 1, 0, 0, 0, 1, 0, 0);
+
+  // Remove foo into draining.
+  EXPECT_CALL(*worker_, stopListener(_, _, _));
+  EXPECT_CALL(*listener_factory_.socket_, close()).Times(2);
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
+  EXPECT_TRUE(manager_->removeListener("foo"));
+  checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
+  EXPECT_CALL(*worker_, removeListener(_, _));
+  listener_foo->drain_manager_->drain_sequence_completion_();
+  checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
+
+  ListenerHandle* listener_foo2 = expectListenerCreate(false, true);
+  EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, default_bind_type, _, 0)).Times(2);
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
   EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
   worker_->callAddCompletion();
   checkStats(__LINE__, 2, 0, 1, 0, 1, 1, 0);
@@ -1909,12 +2028,14 @@ filter_chains:
 
   worker_->callAddCompletion();
 
-  EXPECT_CALL(*listener_foo->drain_manager_, drainClose()).WillOnce(Return(false));
-  EXPECT_CALL(server_.drain_manager_, drainClose()).WillOnce(Return(false));
-  EXPECT_FALSE(listener_foo->context_->drainDecision().drainClose());
+  EXPECT_CALL(*listener_foo->drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(false));
+  EXPECT_CALL(server_.drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(false));
+  EXPECT_FALSE(listener_foo->context_->drainDecision().drainClose(Network::DrainDirection::All));
 
-  EXPECT_CALL(*worker_, stopListener(_, _));
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, stopListener(_, _, _));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
 
   EXPECT_TRUE(manager_->removeListener("foo"));
 
@@ -2171,26 +2292,31 @@ filter_chains:
   worker_->callAddCompletion();
   checkStats(__LINE__, 1, 0, 0, 0, 1, 0, 0);
 
-  EXPECT_CALL(*listener_foo->drain_manager_, drainClose()).WillOnce(Return(false));
-  EXPECT_CALL(server_.drain_manager_, drainClose()).WillOnce(Return(false));
-  EXPECT_FALSE(listener_foo->context_->drainDecision().drainClose());
+  EXPECT_CALL(*listener_foo->drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(false));
+  EXPECT_CALL(server_.drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(false));
+  EXPECT_FALSE(listener_foo->context_->drainDecision().drainClose(Network::DrainDirection::All));
 
-  EXPECT_CALL(*worker_, stopListener(_, _));
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, stopListener(_, _, _));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
   checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
 
   // NOTE: || short circuit here prevents the server drain manager from getting called.
-  EXPECT_CALL(*listener_foo->drain_manager_, drainClose()).WillOnce(Return(true));
-  EXPECT_TRUE(listener_foo->context_->drainDecision().drainClose());
+  EXPECT_CALL(*listener_foo->drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(true));
+  EXPECT_TRUE(listener_foo->context_->drainDecision().drainClose(Network::DrainDirection::All));
 
   EXPECT_CALL(*worker_, removeListener(_, _));
   listener_foo->drain_manager_->drain_sequence_completion_();
   checkStats(__LINE__, 1, 0, 1, 0, 0, 1, 0);
 
-  EXPECT_CALL(*listener_foo->drain_manager_, drainClose()).WillOnce(Return(false));
-  EXPECT_CALL(server_.drain_manager_, drainClose()).WillOnce(Return(true));
-  EXPECT_TRUE(listener_foo->context_->drainDecision().drainClose());
+  EXPECT_CALL(*listener_foo->drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(false));
+  EXPECT_CALL(server_.drain_manager_, drainClose(Network::DrainDirection::All))
+      .WillOnce(Return(true));
+  EXPECT_TRUE(listener_foo->context_->drainDecision().drainClose(Network::DrainDirection::All));
 
   EXPECT_CALL(*listener_foo, onDestroy());
   worker_->callRemovalCompletion();
@@ -2266,7 +2392,7 @@ filter_chains:
   EXPECT_CALL(*listener_foo_update1, onDestroy());
   EXPECT_CALL(*worker_, stopListener(_, _));
   EXPECT_CALL(*listener_factory_.socket_, close());
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
   checkStats(__LINE__, 2, 1, 2, 0, 0, 1, 0);
   EXPECT_CALL(*worker_, removeListener(_, _));
@@ -5765,9 +5891,10 @@ per_connection_buffer_limit_bytes: 10
   // Update foo. Should go into warming, have an immediate warming callback, and start immediate
   // removal.
   ListenerHandle* listener_foo_update2 = expectListenerCreate(false, true);
-  EXPECT_CALL(*worker_, addListener(_, _, _, _));
-  EXPECT_CALL(*worker_, stopListener(_, _));
-  EXPECT_CALL(*listener_foo_update1->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_CALL(*worker_, stopListener(_, _, _));
+  EXPECT_CALL(*listener_foo_update1->drain_manager_,
+              startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml), "version3", true));
   worker_->callAddCompletion();
   checkStats(__LINE__, 1, 2, 0, 0, 1, 1, 0);
@@ -6067,7 +6194,7 @@ filter_chains:
   EXPECT_CALL(*listener_foo_update1, onDestroy());
   EXPECT_CALL(*worker_, stopListener(_, _));
   EXPECT_CALL(*listener_factory_.socket_, close());
-  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*listener_foo->drain_manager_, startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
   checkStats(__LINE__, 1, 1, 1, 0, 0, 1, 0);
   EXPECT_CALL(*worker_, removeListener(_, _));
@@ -6360,13 +6487,15 @@ filter_chains:
 
   // Stop the active listener listener_foo_update1.
   std::function<void()> stop_completion;
-  EXPECT_CALL(*worker_, stopListener(_, _))
-      .WillOnce(Invoke(
-          [&stop_completion](Network::ListenerConfig&, std::function<void()> completion) -> void {
-            ASSERT_TRUE(completion != nullptr);
-            stop_completion = std::move(completion);
-          }));
-  EXPECT_CALL(*listener_foo_update1->drain_manager_, startDrainSequence(_));
+  EXPECT_CALL(*worker_, stopListener(_, _, _))
+      .WillOnce(Invoke([&stop_completion](Network::ListenerConfig&,
+                                          const Network::ExtraShutdownListenerOptions&,
+                                          std::function<void()> completion) -> void {
+        ASSERT_TRUE(completion != nullptr);
+        stop_completion = std::move(completion);
+      }));
+  EXPECT_CALL(*listener_foo_update1->drain_manager_,
+              startDrainSequence(Network::DrainDirection::All, _));
   EXPECT_TRUE(manager_->removeListener("foo"));
 
   EXPECT_CALL(*worker_, removeListener(_, _));
@@ -6384,6 +6513,112 @@ filter_chains:
   auto listener_foo_expect_reuse_socket = expectListenerCreate(true, true);
   EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, _, _, _)).Times(0);
   EXPECT_CALL(*listener_factory_.socket_, duplicate());
+  EXPECT_CALL(listener_foo_expect_reuse_socket->target_, initialize());
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml), "version1", true));
+
+  EXPECT_CALL(*listener_foo, onDestroy());
+  EXPECT_CALL(*listener_foo_expect_reuse_socket, onDestroy());
+}
+
+TEST_P(ListenerManagerImplTest,
+       ListenSocketFactoryIsClonedFromListenerDrainingFilterChainWithMultipleAddresses) {
+  InSequence s;
+
+  EXPECT_CALL(*worker_, start(_, _));
+  ASSERT_TRUE(manager_->startWorkers(guard_dog_, callback_.AsStdFunction()).ok());
+
+  // Add foo listener.
+  const std::string listener_foo_yaml = R"EOF(
+name: foo
+traffic_direction: INBOUND
+address:
+  socket_address:
+    address: 127.0.0.1
+    port_value: 1234
+additional_addresses:
+- address:
+    socket_address:
+      address: 127.0.0.2
+      port_value: 4567
+filter_chains:
+- filters: []
+  )EOF";
+
+  ListenerHandle* listener_foo = expectListenerCreate(true, true);
+  EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, default_bind_type, _, 0)).Times(2);
+  EXPECT_CALL(listener_foo->target_, initialize());
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml)));
+  checkStats(__LINE__, 1, 0, 0, 1, 0, 0, 0);
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  listener_foo->target_.ready();
+  worker_->callAddCompletion();
+  EXPECT_EQ(1UL, manager_->listeners().size());
+
+  // Update foo into warming.
+  const std::string listener_foo_update1_yaml = R"EOF(
+name: foo
+traffic_direction: INBOUND
+address:
+  socket_address:
+      address: 127.0.0.1
+      port_value: 1234
+additional_addresses:
+- address:
+    socket_address:
+      address: 127.0.0.2
+      port_value: 4567
+filter_chains:
+- filters:
+  filter_chain_match:
+    destination_port: 1234
+  )EOF";
+
+  ListenerHandle* listener_foo_update1 = expectListenerOverridden(true, listener_foo);
+  EXPECT_CALL(*listener_factory_.socket_, duplicate()).Times(2);
+  EXPECT_CALL(listener_foo_update1->target_, initialize());
+  EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_update1_yaml)));
+  EXPECT_EQ(1UL, manager_->listeners().size());
+  EXPECT_EQ(1, server_.stats_store_.counter("listener_manager.listener_in_place_updated").value());
+  checkStats(__LINE__, 1, 1, 0, 1, 1, 0, 0);
+
+  // The warmed up starts the drain timer.
+  EXPECT_CALL(*worker_, addListener(_, _, _, _, _));
+  EXPECT_CALL(server_.options_, drainTime()).WillOnce(Return(std::chrono::seconds(600)));
+  Event::MockTimer* filter_chain_drain_timer = new Event::MockTimer(&server_.dispatcher_);
+  EXPECT_CALL(*filter_chain_drain_timer, enableTimer(std::chrono::milliseconds(600000), _));
+  listener_foo_update1->target_.ready();
+  checkStats(__LINE__, 1, 1, 0, 0, 1, 0, 1);
+  EXPECT_CALL(*worker_, removeFilterChains(_, _, _));
+  filter_chain_drain_timer->invokeCallback();
+
+  // Stop the active listener listener_foo_update1.
+  std::function<void()> stop_completion;
+  EXPECT_CALL(*worker_, stopListener(_, _, _))
+      .WillOnce(Invoke([&stop_completion](Network::ListenerConfig&,
+                                          const Network::ExtraShutdownListenerOptions&,
+                                          std::function<void()> completion) -> void {
+        ASSERT_TRUE(completion != nullptr);
+        stop_completion = std::move(completion);
+      }));
+  EXPECT_CALL(*listener_foo_update1->drain_manager_,
+              startDrainSequence(Network::DrainDirection::All, _));
+  EXPECT_TRUE(manager_->removeListener("foo"));
+
+  EXPECT_CALL(*worker_, removeListener(_, _));
+  listener_foo_update1->drain_manager_->drain_sequence_completion_();
+
+  EXPECT_CALL(*listener_foo_update1, onDestroy());
+  worker_->callRemovalCompletion();
+
+  // The snapshot of the listener manager is
+  // 1) listener_foo is draining filter chain. The listen socket is open.
+  // 2) No listen is active. Note that listener_foo_update1 is stopped.
+  //
+  // The next step is to add a listener on the same socket address and the listen socket of
+  // listener_foo will be duplicated.
+  auto listener_foo_expect_reuse_socket = expectListenerCreate(true, true);
+  EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, _, _, _)).Times(0);
+  EXPECT_CALL(*listener_factory_.socket_, duplicate()).Times(2);
   EXPECT_CALL(listener_foo_expect_reuse_socket->target_, initialize());
   EXPECT_TRUE(addOrUpdateListener(parseListenerFromV3Yaml(listener_foo_yaml), "version1", true));
 

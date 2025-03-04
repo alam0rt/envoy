@@ -223,6 +223,7 @@ envoy_cc_test(
         "//source/common/tracing:custom_tag_lib",
         "//source/extensions/access_loggers/common:file_access_log_lib",
         "//source/extensions/request_id/uuid:config",
+        "//test/extensions/filters/network/common/fuzz/utils:network_filter_fuzzer_fakes_lib",
         "//test/mocks/access_log:access_log_mocks",
         "//test/mocks/event:event_mocks",
         "//test/mocks/http:http_mocks",
@@ -236,6 +237,24 @@ envoy_cc_test(
         "//test/test_common:logging_lib",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:test_runtime_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "conn_manager_impl_test",
+    srcs = [
+        # Split to avoid compiler OOM, especially on ASAN.
+        "conn_manager_impl_test.cc",
+        "conn_manager_impl_test_2.cc",
+    ],
+    rbe_pool = "2core",
+    shard_count = 5,
+    deps = [
+        ":conn_manager_impl_test_base_lib",
+        ":custom_header_extension_lib",
+        "//envoy/network:proxy_protocol_options_lib",
+        "//test/extensions/filters/network/common/fuzz/utils:network_filter_fuzzer_fakes_lib",
+        "//test/server:utility_lib",
     ],
 )
 
